@@ -22,6 +22,7 @@ import dev.lhkongyu.lhmiracleroad.packet.ClientDataMessage;
 import dev.lhkongyu.lhmiracleroad.packet.ClientOccupationMessage;
 import dev.lhkongyu.lhmiracleroad.packet.ClientSoulMessage;
 import dev.lhkongyu.lhmiracleroad.packet.PlayerChannel;
+import dev.lhkongyu.lhmiracleroad.data.reloader.EquipmentReloadListener;
 import dev.lhkongyu.lhmiracleroad.client.particle.SoulParticleOption;
 import dev.lhkongyu.lhmiracleroad.registry.ItemsRegistry;
 import dev.lhkongyu.lhmiracleroad.tool.mathcalculator.MathCalculatorUtil;
@@ -35,8 +36,6 @@ import net.minecraft.resources.ResourceKey;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
-import net.minecraft.tags.DamageTypeTags;
-import net.minecraft.tags.TagKey;
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.damagesource.DamageSource;
@@ -48,7 +47,6 @@ import net.minecraft.world.entity.ai.attributes.AttributeInstance;
 import net.minecraft.world.entity.ai.attributes.AttributeModifier;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.item.*;
-import net.minecraft.world.level.Level;
 import net.minecraftforge.fml.ModList;
 import org.joml.Math;
 import org.joml.Vector3f;
@@ -56,13 +54,29 @@ import org.joml.Vector3f;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.util.*;
-import java.util.concurrent.atomic.AtomicReference;
+import net.minecraftforge.registries.ForgeRegistries;
+// Curios API (optional at runtime; compile-time available in this project)
+import top.theillusivec4.curios.api.CuriosApi;
+import top.theillusivec4.curios.api.type.capability.ICuriosItemHandler;
+import top.theillusivec4.curios.api.type.inventory.ICurioStacksHandler;
 
 public class LHMiracleRoadTool {
 
     public static final Map<UUID, PlayerSoulEntity> SOUL_ENTITY_MAP = new HashMap<>();
 
     public static RandomSource randomSource = RandomSource.create();
+
+    // Cache of last-seen Curios signatures per player for cheap change detection
+    public static final Map<UUID, String> CURIOS_SIGNATURES = new HashMap<>();
+    // Per-player tick counters for periodic Curios sweeps
+    public static final Map<UUID, Integer> CURIOS_TICK = new HashMap<>();
+
+    // Fixed UUID for Curios heavy aggregation modifier
+    private static final UUID CURIOS_HEAVY_UUID = UUID.nameUUIDFromBytes("lhmiracleroad:curios_heavy".getBytes());
+
+    // Track Curios-origin punishment modifier UUIDs by player with the attribute name they were applied to
+    // Map<PlayerUUID, Map<ModifierUUID, AttributeName>>
+    private static final Map<UUID, Map<UUID, String>> CURIOS_PUNISHMENTS = new HashMap<>();
 
     /**
      * 转入路径转换为 带 modid 的 ResourceLocation对象
@@ -446,7 +460,18 @@ public class LHMiracleRoadTool {
             case NameTool.ATTACK_CONVERT_LIGHTNING -> LHMiracleRoadAttributes.ATTACK_CONVERT_LIGHTNING;
             case NameTool.ATTACK_CONVERT_DARK -> LHMiracleRoadAttributes.ATTACK_CONVERT_DARK;
             case NameTool.ATTACK_CONVERT_HOLY -> LHMiracleRoadAttributes.ATTACK_CONVERT_HOLY;
-            default -> AttributePointsRewardsReloadListener.recordAttribute.get(attributeName);
+            default -> {
+                Attribute attr = AttributePointsRewardsReloadListener.recordAttribute.get(attributeName);
+                if (attr != null) yield attr;
+                // Fallback: try to resolve from registry using full resource location (e.g., irons_spellbooks:spell_power)
+                try {
+                    ResourceLocation rl = new ResourceLocation(attributeName);
+                    Attribute regAttr = ForgeRegistries.ATTRIBUTES.getValue(rl);
+                    yield regAttr;
+                } catch (Exception ignored) {
+                    yield null;
+                }
+            }
         };
     }
 
@@ -653,6 +678,9 @@ public class LHMiracleRoadTool {
         customEquipmentUpdate(player, playerOccupationAttribute, EquipmentSlot.FEET, null);
         customEquipmentUpdate(player, playerOccupationAttribute, null, InteractionHand.MAIN_HAND);
         customEquipmentUpdate(player, playerOccupationAttribute, null, InteractionHand.OFF_HAND);
+
+    // Also process Curios slots (e.g., ISB spellbook) if Curios is loaded
+    updateCuriosEquipment(player, playerOccupationAttribute);
     }
 
     /**
@@ -677,6 +705,159 @@ public class LHMiracleRoadTool {
         ItemPunishmentTool.cleanItemFromPunishmentAttributeModifier(player, playerOccupationAttribute, itemStackPunishmentAttribute.get());
         //然后重新计算设置一下惩罚信息
         ItemPunishmentTool.setItemToPunishmentAttributeModifier(player, playerOccupationAttribute, itemStackPunishmentAttribute.get());
+    }
+
+    /**
+     * Iterate Curios slots and update punishment states for any stacks that carry our capability.
+     * Safe no-op if Curios mod isn't present or no Curios inventory exists for player.
+     */
+    public static void updateCuriosEquipment(ServerPlayer player, PlayerOccupationAttribute playerOccupationAttribute) {
+        if (!isModExist("curios")) return;
+        var opt = CuriosApi.getCuriosInventory(player).resolve();
+        if (opt.isEmpty()) return;
+        ICuriosItemHandler curios = opt.get();
+        Map<String, ICurioStacksHandler> curiosMap = curios.getCurios();
+        if (curiosMap == null || curiosMap.isEmpty()) return;
+        // 1) Sum Curios-provided heavy and apply a single transient modifier on HEAVY
+    double curiosHeavy = 0.0;
+    // collect modifiers applied during this sweep: uuid -> attributeName
+    Map<UUID, String> appliedThisSweep = new HashMap<>();
+        for (Map.Entry<String, ICurioStacksHandler> entry : curiosMap.entrySet()) {
+            ICurioStacksHandler handler = entry.getValue();
+            if (handler == null) continue;
+            var stacks = handler.getStacks();
+            if (stacks == null) continue;
+            for (int i = 0; i < handler.getSlots(); i++) {
+                ItemStack stack = stacks.getStackInSlot(i);
+                if (stack == null || stack.isEmpty()) continue;
+                Optional<ItemStackPunishmentAttribute> itemAttr = stack
+                        .getCapability(ItemStackPunishmentAttributeProvider.ITEM_STACK_PUNISHMENT_ATTRIBUTE_PROVIDER)
+                        .resolve();
+                if (itemAttr.isEmpty()) {
+            // Fallback: populate from data pack mapping if available (helps items missing cap attach)
+            JsonObject equip = getEquipment(EquipmentReloadListener.EQUIPMENT, stack.getItem().getDescriptionId());
+            var key = ForgeRegistries.ITEMS.getKey(stack.getItem());
+                    if (equip != null) {
+                        // Note: we cannot attach a new capability here, but log for clarity
+            LHMiracleRoad.LOGGER.debug("[CuriosSweep] Missing cap for {} (descId={}), has equipment data -> please re-create stack or ensure cap attaches via AttachCapabilitiesEvent.",
+                key, stack.getItem().getDescriptionId());
+                    } else {
+            LHMiracleRoad.LOGGER.debug("[CuriosSweep] No cap and no equipment for {} (descId={})", key, stack.getItem().getDescriptionId());
+                    }
+                    continue;
+                }
+                // If capability exists but lacks attribute_need, try hydrate from equipment map
+                if (itemAttr.get().getAttributeNeed() == null || itemAttr.get().getAttributeNeed().isEmpty()) {
+                    JsonObject equip = getEquipment(EquipmentReloadListener.EQUIPMENT, stack.getItem().getDescriptionId());
+                    if (equip != null) {
+                        int hv = isAsInt(equip.get(NameTool.HEAVY));
+                        JsonArray need = isAsJsonArray(equip.get("attribute_need"));
+                        itemAttr.get().setHeavy(hv);
+                        ItemPunishmentTool.setHeavyAttributeModifier(itemAttr.get(), need);
+                        LHMiracleRoad.LOGGER.debug("[CuriosSweep] Hydrated cap for {} from equipment data (needs={})", ForgeRegistries.ITEMS.getKey(stack.getItem()), need.size());
+                    }
+                }
+                // Sum heavy
+                curiosHeavy += itemAttr.get().getHeavy();
+                // Clean and re-apply punishment specific to this stack; record applied UUIDs
+                ItemPunishmentTool.cleanItemFromPunishmentAttributeModifier(player, playerOccupationAttribute, itemAttr.get());
+                ItemPunishmentTool.setItemToPunishmentAttributeModifier(player, playerOccupationAttribute, itemAttr.get(),
+                    (attrName, uuid) -> appliedThisSweep.put(uuid, attrName)
+                );
+                LHMiracleRoad.LOGGER.trace("[CuriosSweep] Applied punishments (if any) for {}", ForgeRegistries.ITEMS.getKey(stack.getItem()));
+            }
+        }
+        // Remove any previously applied Curios-origin punishments that did not get re-applied this sweep
+        Map<UUID, String> previously = CURIOS_PUNISHMENTS.getOrDefault(player.getUUID(), Collections.emptyMap());
+        if (!previously.isEmpty()) {
+            for (Map.Entry<UUID, String> entry : previously.entrySet()) {
+                UUID uuid = entry.getKey();
+                String attrName = entry.getValue();
+                if (!appliedThisSweep.containsKey(uuid)) {
+                    AttributeModifier mod = playerOccupationAttribute.getPunishmentAttributeModifier().get(uuid.toString());
+                    if (mod != null) {
+                        Attribute attr = stringConversionAttribute(attrName);
+                        if (attr != null) {
+                            AttributeInstance inst = player.getAttribute(attr);
+                            if (inst != null) inst.removeModifier(uuid);
+                        } else {
+                            // Fallback: sweep all attributes if resolution failed
+                            for (Attribute a : ForgeRegistries.ATTRIBUTES.getValues()) {
+                                AttributeInstance inst = player.getAttribute(a);
+                                if (inst != null && inst.getModifier(uuid) != null) inst.removeModifier(uuid);
+                            }
+                        }
+                        playerOccupationAttribute.removePunishmentAttributeModifier(uuid.toString());
+                    }
+                }
+            }
+        }
+        CURIOS_PUNISHMENTS.put(player.getUUID(), appliedThisSweep);
+        // Apply aggregated heavy modifier
+        AttributeInstance heavyAttr = player.getAttribute(LHMiracleRoadAttributes.HEAVY);
+        if (heavyAttr != null) {
+            // remove existing curios-heavy modifier if present
+            if (heavyAttr.getModifier(CURIOS_HEAVY_UUID) != null) {
+                heavyAttr.removeModifier(CURIOS_HEAVY_UUID);
+            }
+            if (curiosHeavy != 0.0) {
+                AttributeModifier modifier = new AttributeModifier(CURIOS_HEAVY_UUID, "curios_heavy", curiosHeavy, AttributeModifier.Operation.ADDITION);
+                heavyAttr.addTransientModifier(modifier);
+            }
+        }
+        // Recompute movement penalty from heavy after updating HEAVY value
+        AttributeInstance heavyAttributeInstance = player.getAttribute(LHMiracleRoadAttributes.HEAVY);
+        AttributeInstance burdenAttributeInstance = player.getAttribute(LHMiracleRoadAttributes.BURDEN);
+        if (heavyAttributeInstance != null && burdenAttributeInstance != null) {
+            ItemPunishmentTool.setHeavyAttributeModifier(playerOccupationAttribute, player, heavyAttributeInstance.getValue(), burdenAttributeInstance.getValue());
+        }
+    }
+
+    /**
+     * Build a compact signature of the player's Curios inventory to detect changes.
+     * Returns empty if Curios not loaded or no inventory.
+     */
+    public static Optional<String> getCuriosSignature(ServerPlayer player) {
+        if (!isModExist("curios")) return Optional.empty();
+        var opt = CuriosApi.getCuriosInventory(player).resolve();
+        if (opt.isEmpty()) return Optional.empty();
+        ICuriosItemHandler curios = opt.get();
+        Map<String, ICurioStacksHandler> curiosMap = curios.getCurios();
+        if (curiosMap == null || curiosMap.isEmpty()) return Optional.of("");
+        StringBuilder sb = new StringBuilder();
+        curiosMap.forEach((slotId, handler) -> {
+            if (handler == null) return;
+            var stacks = handler.getStacks();
+            if (stacks == null) return;
+            sb.append(slotId).append(':');
+            for (int i = 0; i < handler.getSlots(); i++) {
+                ItemStack stack = stacks.getStackInSlot(i);
+                if (stack == null || stack.isEmpty()) {
+                    sb.append("|");
+                } else {
+                    sb.append(stack.getItem().toString());
+                    // include basic tag hash if present to detect NBT changes
+                    if (stack.hasTag()) sb.append('#').append(Objects.hashCode(stack.getTag()));
+                    sb.append('|');
+                }
+            }
+            sb.append(';');
+        });
+        return Optional.of(sb.toString());
+    }
+
+    /**
+     * True every N ticks for this player (server-only), used as a safety net to re-apply Curios punishments.
+     */
+    public static boolean curiosPeriodicTick(ServerPlayer player, int intervalTicks) {
+        UUID id = player.getUUID();
+        int n = CURIOS_TICK.getOrDefault(id, 0) + 1;
+        if (n >= intervalTicks) {
+            CURIOS_TICK.put(id, 0);
+            return true;
+        }
+        CURIOS_TICK.put(id, n);
+        return false;
     }
 
     /**

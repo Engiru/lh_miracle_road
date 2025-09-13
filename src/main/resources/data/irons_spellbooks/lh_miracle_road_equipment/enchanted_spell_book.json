@@ -1,0 +1,9 @@
+{
+  "attribute_need": [
+    {
+      "attribute_id": "brain",
+      "need_points": 25,
+      "punishment_id": "iron_magic"
+    }
+  ]
+}

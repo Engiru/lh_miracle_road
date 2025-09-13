@@ -24,6 +24,7 @@ import javax.annotation.Nullable;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.function.BiConsumer;
 
 public class ItemPunishmentTool {
 
@@ -187,6 +188,17 @@ public class ItemPunishmentTool {
      * @param itemToPunishmentAttribute
      */
     public static void setItemToPunishmentAttributeModifier(ServerPlayer player,PlayerOccupationAttribute playerOccupationAttribute,ItemStackPunishmentAttribute itemToPunishmentAttribute){
+        setItemToPunishmentAttributeModifier(player, playerOccupationAttribute, itemToPunishmentAttribute, null);
+    }
+
+    /**
+     * If onApplied is provided, it will be invoked for every punishment applied with
+     * the attribute name and the UUID of the modifier that was added to the player.
+     */
+    public static void setItemToPunishmentAttributeModifier(ServerPlayer player,
+                                                            PlayerOccupationAttribute playerOccupationAttribute,
+                                                            ItemStackPunishmentAttribute itemToPunishmentAttribute,
+                                                            @Nullable BiConsumer<String, UUID> onApplied){
         //判断是否启用点数限制
         if (!LHMiracleRoadConfig.COMMON.IS_SKILL_POINTS_RESTRICT.get()) return;
         //判断是否启用点数限制
@@ -221,6 +233,13 @@ public class ItemPunishmentTool {
                     if (operation == null) continue;
                     Attribute attribute = LHMiracleRoadTool.stringConversionAttribute(attributeName);
                     if (attribute != null) {
+                        // Before applying, ensure we don't stack duplicates for the same attribute: if already recorded, remove first
+                        AttributeModifier existing = itemToPunishmentAttribute.getRecordPunishmentAttributeModifier().get(attributeName);
+                        if (existing != null) {
+                            // Best-effort removal on re-application path
+                            AttributeInstance inst = player.getAttribute(attribute);
+                            if (inst != null) inst.removeModifier(existing);
+                        }
                         UUID uuid = UUID.randomUUID();
                         AttributeModifier attributeModifier = new AttributeModifier(uuid, "", punishmentValue, operation);
                         player.getAttribute(attribute).addTransientModifier(attributeModifier);
@@ -229,6 +248,7 @@ public class ItemPunishmentTool {
                         }
                         playerOccupationAttribute.addPunishmentAttributeModifier(uuid.toString(), attributeModifier);
                         itemToPunishmentAttribute.addRecordPunishmentAttributeModifier(attributeName, attributeModifier);
+                        if (onApplied != null) onApplied.accept(attributeName, uuid);
                     }
                 }
                 //如果有多个属性要求也只执行一次
